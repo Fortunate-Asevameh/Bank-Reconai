@@ -51,6 +51,31 @@ monthly summary by category, Excel export.
 5. **Financial summary**: cash flow statement and the suspense warning for unresolved items.
 6. **Accuracy** tab: results against the Answer Key; untick the rules layer to show ML-only performance.
 
+## Using your own data
+
+In the sidebar choose **Data source**:
+
+1. **Bundled sample data** - the fictional FY2025 dataset (has an answer key, so accuracy is scored).
+2. **Upload template workbook** - an .xlsx laid out like `sample_data.xlsx` (sheets `Bank Statement` and `Cash Book`; optional `Answer Key`).
+3. **Upload my own bank + cash book files** - any CSV or Excel export. Steps:
+   - Upload the bank statement and the cash book (two files).
+   - Title rows above the column headings are skipped automatically.
+   - Check the column matching in the two sidebar panels. The app guesses from the header names; correct any wrong guess.
+   - Use either separate Debit/Credit columns, or one signed Amount column (negative = money out).
+   - If your bank file has no Balance column, type the opening balance in the sidebar.
+   - Tick "newest-first" if the bank file lists the latest transaction at the top.
+
+**No cash book?** Leave the cash book uploader empty. The app then classifies transactions and builds the cash flow summary,
+but skips reconciliation. The Reconciliation tab instead runs bank-only checks: possible duplicate transactions and running-balance breaks.
+
+Notes for your own data:
+- Dates such as `2025-03-10` are read as year-month-day; dates such as `10/03/2025` are read day-first.
+- Cash book convention: Receipts = money in, Payments = money out (in a ledger these are the Debit and Credit columns respectively).
+- Use one financial year (12 months) at a time.
+- With no answer key, the ML layer is trained on the bundled sample and then applied to your data. Accuracy cannot be scored automatically.
+  To score it, label a sample yourself (add an `Answer Key` sheet to a template workbook with columns `S/N`, `Category`, `Clarity`, `Recon Status`).
+- The keyword rules contain some sample-specific names (e.g. the sample director). Edit the `RULES` list in `recon_engine.py` to suit a new company.
+
 ## Measured results on the sample data (honest reporting)
 
 ML trained on Jan-Jun labels, tested on Jul-Dec (290 transactions):
