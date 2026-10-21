@@ -1,0 +1,351 @@
+"""
+ReconAI engine - transaction classification + bank/cash-book reconciliation.
+
+Classification : Layer 1 keyword/regex rules  ->  Layer 2 ML (TF-IDF + Logistic Regression)
+                 ->  Layer 3 low-confidence items go to a human review queue.
+Reconciliation : exact match -> transposition match -> many-to-one -> one-to-many
+                 -> classify leftovers (deposit in transit, outstanding cheque, bank-only, duplicate).
+"""
+import re
+import itertools
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+
+# ----------------------------------------------------------------------------- loading
+def load_workbook_data(path_or_file):
+    """Read the sample workbook (Bank Statement, Cash Book, Answer Key)."""
+    xl = pd.ExcelFile(path_or_file)
+    bank = pd.read_excel(xl, sheet_name="Bank Statement", header=7)
+    bank = bank[pd.to_numeric(bank["S/N"], errors="coerce").notna()].copy()
+    bank = bank.rename(columns={"Trans Date": "date", "Narration": "narration", "Reference": "reference",
+                                "Debit (NGN)": "debit", "Credit (NGN)": "credit", "Balance (NGN)": "balance", "S/N": "sn"})
+    bank = bank[["sn", "date", "reference", "narration", "debit", "credit", "balance"]]
+    book = pd.read_excel(xl, sheet_name="Cash Book", header=4)
+    book = book[book["Book Ref"].astype(str).str.startswith("CB-")].copy()
+    book = book.rename(columns={"Book Ref": "ref", "Date": "date", "Description": "description",
+                                "Receipts (NGN)": "receipt", "Payments (NGN)": "payment"})[["ref", "date", "description", "receipt", "payment"]]
+    try:
+        key = pd.read_excel(xl, sheet_name="Answer Key", header=3)
+        key = key[pd.to_numeric(key["S/N"], errors="coerce").notna()].copy()
+        key = key.rename(columns={"S/N": "sn", "Category": "true_category", "Clarity": "clarity", "Recon Status": "true_status"})
+        key = key[["sn", "true_category", "clarity", "true_status"]]
+    except Exception:
+        key = None
+    return _clean_bank(bank), _clean_book(book), key
+
+
+def _clean_bank(bank):
+    b = bank.copy()
+    b["date"] = pd.to_datetime(b["date"])
+    for c in ("debit", "credit"):
+        b[c] = pd.to_numeric(b[c], errors="coerce").fillna(0.0)
+    b["sn"] = b["sn"].astype(int)
+    b["net"] = (b["credit"] - b["debit"]).round(2)
+    b["month"] = b["date"].dt.month
+    return b.reset_index(drop=True)
+
+
+def _clean_book(book):
+    k = book.copy()
+    k["date"] = pd.to_datetime(k["date"])
+    for c in ("receipt", "payment"):
+        k[c] = pd.to_numeric(k[c], errors="coerce").fillna(0.0)
+    k["net"] = (k["receipt"] - k["payment"]).round(2)
+    return k.reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------------- classification
+# (regex, category, confidence, direction)  direction: 'DR', 'CR' or None
+RULES = [
+    (r"REFUND CR NOTE", "Supplier Refund / Credit Note", 0.70, "CR"),
+    (r"OVERPAYMENT REFUND", "Customer Refund", 0.90, "DR"),
+    (r"REV/DUP", "Bank Reversal / Error", 0.75, "CR"),
+    (r"POS SETTLEMENT", "Sales - POS Settlements", 0.97, "CR"),
+    (r"ONLINE GATEWAY SETTLEMENT", "Sales - Online Gateway Settlements", 0.97, "CR"),
+    (r"LOAN DISBURSEMENT", "Loan Proceeds", 0.98, "CR"),
+    (r"LOAN MGT FEE|VAT ON LOAN MGT", "Loan Facility Fees", 0.97, "DR"),
+    (r"LOAN REPAYMENT", "Loan Repayment - Principal + Interest", 0.98, "DR"),
+    (r"PAYE", "PAYE Remittance", 0.98, "DR"),
+    (r"PENSION", "Pension Remittance", 0.98, "DR"),
+    (r"VAT REMITTANCE", "VAT Remittance", 0.98, "DR"),
+    (r"WHT REMITTANCE", "WHT Remittance", 0.98, "DR"),
+    (r"CIT PAYMENT", "Company Income Tax", 0.98, "DR"),
+    (r"STAMP DUTY", "Stamp Duty", 0.98, "DR"),
+    (r"UNPAID CHEQUE COMMISSION|ACCOUNT MAINTENANCE|SMS ALERT|NIP TRANSFER FEES|VAT ON BANK CHARGES|SWIFT", "Bank Charges", 0.97, "DR"),
+    (r"INTEREST ON CREDIT", "Interest Income", 0.97, "CR"),
+    (r"RETURNED CHEQUE", "Returned Cheque (Dishonoured)", 0.80, "DR"),
+    (r"CHEQUE DEPOSIT", "Sales - Cheque Deposits", 0.90, "CR"),
+    (r"STAFF SALARIES|BONUS", "Salaries & Wages", 0.98, "DR"),
+    (r"POWER DISCO|BROADBAND", "Utilities (Power & Internet)", 0.97, "DR"),
+    (r"PETRO STATION|APEX LOGISTICS", "Fuel & Logistics", 0.90, "DR"),
+    (r"SOCIAL MEDIA ADS|FLYERS", "Marketing & Advertising", 0.90, "DR"),
+    (r"STATIONERY", "Office & Admin", 0.95, "DR"),
+    (r"RENT", "Rent", 0.95, "DR"),
+    (r"INSURANCE", "Insurance", 0.95, "DR"),
+    (r"GENERATOR|LAGOS MOTORS", "Equipment & Vehicle Purchases", 0.95, "DR"),
+    (r"AUDIT FEE|LEGAL FEES|CORPORATE AFFAIRS", "Professional Fees", 0.95, "DR"),
+    (r"REPAIR", "Repairs & Maintenance", 0.80, "DR"),
+    (r"FX PURCHASE", "Import Purchases (FX)", 0.70, "DR"),
+    (r"CASH WITHDRAWAL", "Petty Cash Withdrawals", 0.65, "DR"),
+    (r"CASH DEPOSIT|CDM DEPOSIT", "Sales - Cash Deposits", 0.65, "CR"),
+    (r"ADEBAYO/FUNDING", "Owner Capital Injection", 0.60, "CR"),
+    (r"ADEBAYO/ADVANCE", "Director Loan Received", 0.60, "CR"),
+    (r"ADEBAYO/REFUND", "Director Loan Repaid", 0.60, "DR"),
+    (r"ADEBAYO/(UPKEEP|PERSONAL)|SCHOOL FEES", "Owner Drawings", 0.70, "DR"),
+    (r"SAVINGS ACC|TRF FROM 0245", "Transfer Between Own Accounts", 0.65, None),
+    (r"MOB TRF-DR|MOBILE TRF CR REF|POS/WEB|TRF FRM 3PL", "Unidentified - Suspense", 0.50, None),
+    (r"NIP TRF FROM .*/INV \d+", "Sales - Customer Transfers", 0.95, "CR"),
+    (r"(NIP TRF TO|CHQ PAID \d+ -) .*(LTD|PALLETS).*", "Inventory / Supplier Payments", 0.92, "DR"),
+]
+_COMPILED = [(re.compile(p), c, conf, d) for p, c, conf, d in RULES]
+
+
+def rule_classify(narration, debit, credit):
+    direction = "DR" if debit > 0 else "CR"
+    for rx, cat, conf, d in _COMPILED:
+        if d and d != direction:
+            continue
+        if rx.search(narration.upper()):
+            return cat, conf
+    return None, 0.0
+
+
+def _normalise(text, direction):
+    t = re.sub(r"\d+", " ", str(text).upper())
+    t = re.sub(r"[^A-Z& ]", " ", t)
+    return f"{direction} " + re.sub(r"\s+", " ", t).strip()
+
+
+def _features(df):
+    return [_normalise(n, "DR" if d > 0 else "CR") for n, d in zip(df["narration"], df["debit"])]
+
+
+def train_model(df, labels):
+    """TF-IDF (words + char n-grams) + Logistic Regression on the narration text."""
+    from sklearn.pipeline import FeatureUnion
+    feats = FeatureUnion([
+        ("w", TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True)),
+        ("c", TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True)),
+    ])
+    model = make_pipeline(feats, LogisticRegression(max_iter=2000, C=20, class_weight="balanced"))
+    model.fit(_features(df), labels)
+    return model
+
+
+def classify(bank, model=None, threshold=0.70, use_rules=True):
+    """Hybrid classification. Adds category, confidence, method and needs_review."""
+    out = bank.copy()
+    cats, confs, methods = [], [], []
+    ml_pred, ml_conf = (None, None)
+    if model is not None:
+        proba = model.predict_proba(_features(out))
+        ml_pred = model.classes_[proba.argmax(axis=1)]
+        ml_conf = proba.max(axis=1)
+    for i, row in out.iterrows():
+        cat, conf = rule_classify(row["narration"], row["debit"], row["credit"]) if use_rules else (None, 0.0)
+        if cat:
+            cats.append(cat); confs.append(conf); methods.append("Rule")
+        elif model is not None:
+            cats.append(ml_pred[i]); confs.append(float(ml_conf[i])); methods.append("ML")
+        else:
+            cats.append("Unidentified - Suspense"); confs.append(0.0); methods.append("None")
+    out["category"] = cats
+    out["confidence"] = np.round(confs, 3)
+    out["method"] = methods
+    out["needs_review"] = out["confidence"] < threshold
+    return out
+
+
+# ----------------------------------------------------------------------------- reconciliation
+def _digits(x):
+    return sorted(str(int(round(abs(x) * 100))))
+
+
+def reconcile(bank, book, day_window=7):
+    bank = bank.copy(); book = book.copy()
+    bank["recon_status"] = ""; bank["book_ref"] = ""
+    book["recon_status"] = ""; book["bank_sn"] = ""
+    ub = set(bank.index); uk = set(book.index)
+
+    def mark(bi_list, ki_list, status):
+        for bi in bi_list:
+            bank.at[bi, "recon_status"] = status
+            bank.at[bi, "book_ref"] = ", ".join(book.at[k, "ref"] for k in ki_list)
+        for ki in ki_list:
+            book.at[ki, "recon_status"] = status
+            book.at[ki, "bank_sn"] = ", ".join(str(bank.at[b, "sn"]) for b in bi_list)
+        ub.difference_update(bi_list); uk.difference_update(ki_list)
+
+    def timing(status, bis, kis):
+        mb = {bank.at[b, "date"].month for b in bis}; mk = {book.at[k, "date"].month for k in kis}
+        return "Timing difference" if status == "Matched" and mb != mk else status
+
+    # Pass 1: exact amount within date window (closest date first)
+    cands = []
+    for bi in ub:
+        for ki in uk:
+            if abs(bank.at[bi, "net"] - book.at[ki, "net"]) < 0.005:
+                dd = abs((bank.at[bi, "date"] - book.at[ki, "date"]).days)
+                if dd <= day_window:
+                    cands.append((dd, bi, ki))
+    for dd, bi, ki in sorted(cands):
+        if bi in ub and ki in uk:
+            mark([bi], [ki], timing("Matched", [bi], [ki]))
+
+    # Pass 2: transposed digits (same digits, different order)
+    for bi in sorted(ub):
+        for ki in sorted(uk):
+            nb, nk = bank.at[bi, "net"], book.at[ki, "net"]
+            if nb * nk > 0 and abs(nb - nk) > 0.005 and _digits(nb) == _digits(nk) \
+                    and abs((bank.at[bi, "date"] - book.at[ki, "date"]).days) <= day_window:
+                mark([bi], [ki], "Amount difference"); break
+
+    # Pass 3: many bank lines -> one book entry
+    for ki in sorted(uk):
+        target = book.at[ki, "net"]
+        pool = [b for b in ub if bank.at[b, "net"] * target > 0 and abs(bank.at[b, "net"]) < abs(target) + 0.005
+                and abs((bank.at[b, "date"] - book.at[ki, "date"]).days) <= day_window]
+        pool = sorted(pool, key=lambda b: abs((bank.at[b, "date"] - book.at[ki, "date"]).days))[:14]
+        found = None
+        for n in range(2, 7):
+            for combo in itertools.combinations(pool, n):
+                if abs(sum(bank.at[b, "net"] for b in combo) - target) < 0.005:
+                    found = list(combo); break
+            if found: break
+        if found:
+            mark(found, [ki], "Matched (grouped)")
+
+    # Pass 4: one bank line -> many book entries
+    for bi in sorted(ub):
+        target = bank.at[bi, "net"]
+        pool = [k for k in uk if book.at[k, "net"] * target > 0 and abs(book.at[k, "net"]) < abs(target) + 0.005
+                and abs((book.at[k, "date"] - bank.at[bi, "date"]).days) <= day_window]
+        pool = sorted(pool, key=lambda k: abs((book.at[k, "date"] - bank.at[bi, "date"]).days))[:12]
+        found = None
+        for n in range(2, 5):
+            for combo in itertools.combinations(pool, n):
+                if abs(sum(book.at[k, "net"] for k in combo) - target) < 0.005:
+                    found = list(combo); break
+            if found: break
+        if found:
+            mark([bi], found, "Matched (split)")
+
+    # Pass 5: leftovers
+    matched_sig = {(round(bank.at[b, "net"], 2), bank.at[b, "date"]) for b in bank.index if b not in ub}
+    last_day = bank["date"].max()
+    for bi in sorted(ub):
+        hint = "Possible duplicate posting by bank" if (round(bank.at[bi, "net"], 2), bank.at[bi, "date"]) in matched_sig else ""
+        bank.at[bi, "recon_status"] = "Bank only (not in cash book)"; bank.at[bi, "book_ref"] = hint
+    matched_book_sig = {(round(book.at[k, "net"], 2), book.at[k, "date"]) for k in book.index if k not in uk}
+    for ki in sorted(uk):
+        net, d = round(book.at[ki, "net"], 2), book.at[ki, "date"]
+        if (net, d) in matched_book_sig:
+            book.at[ki, "recon_status"] = "Duplicate entry in cash book"
+        elif (last_day - d).days <= 5:
+            book.at[ki, "recon_status"] = "Deposit in transit" if net > 0 else "Outstanding cheque"
+        else:
+            book.at[ki, "recon_status"] = "In cash book only - investigate"
+    return bank, book
+
+
+def bank_rec_statement(bank, book, bank_recon, book_recon, opening):
+    """Year-end bank reconciliation statement built from the engine output."""
+    bank_close = opening + bank["net"].sum()
+    book_close = opening + book["net"].sum()
+    dit = book_recon.loc[book_recon.recon_status == "Deposit in transit", "net"].sum()
+    oc = book_recon.loc[book_recon.recon_status == "Outstanding cheque", "net"].sum()
+    bo = bank_recon[bank_recon.recon_status == "Bank only (not in cash book)"]
+    bank_credits = bo.loc[bo.net > 0, "net"].sum(); bank_debits = bo.loc[bo.net < 0, "net"].sum()
+    # amount errors: adjustment = bank amount - book amount (signed)
+    amt = 0.0
+    for _, r in bank_recon[bank_recon.recon_status == "Amount difference"].iterrows():
+        ks = book_recon[book_recon.bank_sn == str(r["sn"])]
+        amt += r["net"] - ks["net"].sum()
+    dup = -book_recon.loc[book_recon.recon_status == "Duplicate entry in cash book", "net"].sum()
+    rows = [
+        ("BANK SIDE", None),
+        ("Balance per bank statement", bank_close),
+        ("Add: deposits in transit", dit),
+        ("Less: outstanding cheques", oc),
+        ("Adjusted bank balance", bank_close + dit + oc),
+        ("CASH BOOK SIDE", None),
+        ("Balance per cash book", book_close),
+        ("Add: bank credits not in cash book", bank_credits),
+        ("Less: bank debits not in cash book", bank_debits),
+        ("Correct: amount errors in cash book", amt),
+        ("Add back: duplicate entries in cash book", dup),
+        ("Adjusted cash book balance", book_close + bank_credits + bank_debits + amt + dup),
+    ]
+    diff = round((bank_close + dit + oc) - (book_close + bank_credits + bank_debits + amt + dup), 2)
+    return pd.DataFrame(rows, columns=["Item", "Amount (NGN)"]), diff
+
+
+# ----------------------------------------------------------------------------- summaries
+CLASS_OF = {}
+_INV = {"Equipment & Vehicle Purchases"}
+_FIN = {"Loan Proceeds", "Loan Repayment - Principal + Interest", "Loan Facility Fees", "Owner Capital Injection",
+        "Director Loan Received", "Director Loan Repaid", "Owner Drawings"}
+_OTH = {"Transfer Between Own Accounts", "Bank Reversal / Error", "Unidentified - Suspense"}
+
+
+def fs_class(cat):
+    if cat in _INV: return "Investing"
+    if cat in _FIN: return "Financing"
+    if cat in _OTH: return "Other / Suspense"
+    return "Operating"
+
+
+def monthly_summary(classified):
+    d = classified.copy()
+    d["fs_class"] = d["category"].map(fs_class)
+    piv = d.pivot_table(index=["fs_class", "category"], columns="month", values="net", aggfunc="sum", fill_value=0.0)
+    piv["Total"] = piv.sum(axis=1)
+    return piv
+
+
+def cash_flow_statement(classified, opening):
+    d = classified.copy(); d["fs_class"] = d["category"].map(fs_class)
+    by = d.groupby("fs_class")["net"].sum()
+    out = pd.DataFrame({"Item": ["Net cash from operating activities", "Net cash from investing activities",
+                                 "Net cash from financing activities", "Other / suspense items (unresolved)",
+                                 "Net movement in cash", "Opening cash balance", "Closing cash balance"],
+                        "Amount (NGN)": [by.get("Operating", 0), by.get("Investing", 0), by.get("Financing", 0),
+                                         by.get("Other / Suspense", 0), by.sum(), opening, opening + by.sum()]})
+    return out
+
+
+def evaluate_classification(classified, key, test_mask=None):
+    m = classified.merge(key, on="sn")
+    if test_mask is not None:
+        m = m[m["sn"].isin(classified.loc[test_mask, "sn"])]
+    m["correct"] = m["category"] == m["true_category"]
+    overall = m["correct"].mean()
+    by_clarity = m.groupby("clarity")["correct"].agg(["mean", "count"]).rename(columns={"mean": "accuracy", "count": "n"})
+    by_method = m.groupby("method")["correct"].agg(["mean", "count"]).rename(columns={"mean": "accuracy", "count": "n"})
+    return overall, by_clarity, by_method, m
+
+
+def evaluate_reconciliation(bank_recon, key):
+    m = bank_recon.merge(key[["sn", "true_status"]], on="sn")
+    m["correct"] = m["recon_status"] == m["true_status"]
+    return m["correct"].mean(), m
+
+
+def opening_balance(bank):
+    """Opening balance implied by the first statement line."""
+    return float(round(bank["balance"].iloc[0] - bank["net"].iloc[0], 2))
+
+
+def apply_corrections(classified, corrections):
+    """Overwrite predictions with human decisions {sn: category}."""
+    out = classified.copy()
+    for sn, cat in corrections.items():
+        m = out["sn"] == sn
+        out.loc[m, "category"] = cat
+        out.loc[m, "confidence"] = 1.0
+        out.loc[m, "method"] = "Human"
+        out.loc[m, "needs_review"] = False
+    return out

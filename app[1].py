@@ -1,0 +1,204 @@
+"""
+ReconAI - Transaction Classification & Reconciliation prototype (Streamlit).
+Run:  streamlit run app.py
+"""
+import io
+import warnings
+import pandas as pd
+import streamlit as st
+import recon_engine as E
+
+warnings.filterwarnings("ignore")
+st.set_page_config(page_title="ReconAI", page_icon="🧾", layout="wide")
+
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+ALL_CATS = sorted({c for _, c, _, _ in E.RULES} | {"Sales - Customer Transfers", "Inventory / Supplier Payments",
+                                                  "Salaries & Wages", "Bank Charges", "Interest Income", "Unidentified - Suspense"})
+money = lambda x: f"₦{x:,.2f}"
+
+
+# ----------------------------------------------------------------------------- data
+@st.cache_data(show_spinner=False)
+def load(file_bytes):
+    return E.load_workbook_data(io.BytesIO(file_bytes))
+
+
+st.sidebar.title("🧾 ReconAI")
+st.sidebar.caption("Transaction classification & reconciliation prototype")
+up = st.sidebar.file_uploader("Upload workbook (.xlsx)", type=["xlsx"],
+                              help="Must contain 'Bank Statement' and 'Cash Book' sheets (same layout as the sample).")
+if up is not None:
+    raw = up.getvalue()
+else:
+    with open("sample_data.xlsx", "rb") as f:
+        raw = f.read()
+    st.sidebar.info("Using the bundled sample data (fictional company, FY2025).")
+
+try:
+    bank, book, key = load(raw)
+except Exception as e:  # noqa
+    st.error(f"Could not read the workbook: {e}")
+    st.stop()
+opening = E.opening_balance(bank)
+
+st.sidebar.subheader("Settings")
+use_rules = st.sidebar.checkbox("Layer 1: keyword rules", value=True)
+threshold = st.sidebar.slider("Review threshold (confidence below this goes to review)", 0.30, 0.95, 0.70, 0.05)
+train_months = st.sidebar.slider("ML training window (first N months, needs Answer Key)", 3, 11, 6)
+window = st.sidebar.slider("Reconciliation date window (days)", 1, 14, 7)
+
+# ----------------------------------------------------------------------------- model + classification
+if "corrections" not in st.session_state:
+    st.session_state.corrections = {}
+if "extra_train" not in st.session_state:
+    st.session_state.extra_train = False
+
+model = None
+if key is not None:
+    lab = bank.merge(key, on="sn")
+    tr = lab[lab["month"] <= train_months]
+    model = E.train_model(tr, tr["true_category"])
+else:
+    st.sidebar.warning("No 'Answer Key' sheet found: ML layer disabled, rules only.")
+
+classified = E.classify(bank, model, threshold, use_rules=use_rules)
+
+# human corrections override predictions
+classified = E.apply_corrections(classified, st.session_state.corrections)
+
+# optional: retrain using corrections + confident rule results
+if st.session_state.extra_train and st.session_state.corrections:
+    conf = classified[(classified["confidence"] >= 0.9)]
+    model2 = E.train_model(conf, conf["category"])
+    classified = E.classify(bank, model2, threshold, use_rules=use_rules)
+    classified = E.apply_corrections(classified, st.session_state.corrections)
+
+bank_r, book_r = E.reconcile(bank, book, window)
+statement, diff = E.bank_rec_statement(bank_r, book_r, bank_r, book_r, opening)
+
+# ----------------------------------------------------------------------------- header
+st.title("ReconAI: Transaction Classification & Reconciliation")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Bank transactions", f"{len(bank):,}")
+c2.metric("Cash book entries", f"{len(book):,}")
+c3.metric("Needs review", f"{int(classified['needs_review'].sum()):,}")
+c4.metric("Reconciliation difference", money(diff), help="Adjusted bank balance minus adjusted cash book balance. Must be zero.")
+
+t1, t2, t3, t4, t5, t6 = st.tabs(["1 Data", "2 Classification", "3 Review queue", "4 Reconciliation", "5 Financial summary", "6 Accuracy & export"])
+
+# ----------------------------------------------------------------------------- tab 1
+with t1:
+    st.subheader("Bank statement")
+    st.dataframe(bank[["sn", "date", "reference", "narration", "debit", "credit", "balance"]], use_container_width=True, height=300)
+    st.subheader("Cash book")
+    st.dataframe(book[["ref", "date", "description", "receipt", "payment"]], use_container_width=True, height=300)
+
+# ----------------------------------------------------------------------------- tab 2
+with t2:
+    st.subheader("Classified transactions")
+    f1, f2, f3 = st.columns(3)
+    sel_cat = f1.multiselect("Category", sorted(classified["category"].unique()))
+    sel_m = f2.multiselect("Method", ["Rule", "ML", "Human"], default=[])
+    only_low = f3.checkbox("Only low confidence")
+    v = classified.copy()
+    if sel_cat: v = v[v["category"].isin(sel_cat)]
+    if sel_m: v = v[v["method"].isin(sel_m)]
+    if only_low: v = v[v["needs_review"]]
+    st.dataframe(v[["sn", "date", "narration", "debit", "credit", "category", "confidence", "method", "needs_review"]],
+                 use_container_width=True, height=450)
+    st.caption("Rule = keyword match; ML = TF-IDF + Logistic Regression prediction; Human = your correction.")
+    mc = classified["method"].value_counts()
+    st.bar_chart(mc)
+
+# ----------------------------------------------------------------------------- tab 3
+with t3:
+    st.subheader("Review queue (low-confidence classifications)")
+    q = classified[classified["needs_review"]][["sn", "date", "narration", "debit", "credit", "category", "confidence", "method"]].copy()
+    st.write(f"{len(q)} transactions need a decision. Pick the correct category, then click **Apply corrections**.")
+    if len(q):
+        edited = st.data_editor(
+            q, use_container_width=True, height=450, hide_index=True, key="review_editor",
+            disabled=["sn", "date", "narration", "debit", "credit", "confidence", "method"],
+            column_config={"category": st.column_config.SelectboxColumn("category", options=ALL_CATS, required=True)})
+        b1, b2 = st.columns(2)
+        if b1.button("Apply corrections"):
+            changed = edited.merge(q[["sn", "category"]], on="sn", suffixes=("", "_old"))
+            for _, r in changed.iterrows():
+                st.session_state.corrections[int(r["sn"])] = r["category"]
+            st.rerun()
+        if b2.button("Apply + retrain model on corrections"):
+            changed = edited.merge(q[["sn", "category"]], on="sn", suffixes=("", "_old"))
+            for _, r in changed.iterrows():
+                st.session_state.corrections[int(r["sn"])] = r["category"]
+            st.session_state.extra_train = True
+            st.rerun()
+    else:
+        st.success("Nothing to review at this threshold.")
+    st.caption(f"Corrections made this session: {len(st.session_state.corrections)}")
+
+# ----------------------------------------------------------------------------- tab 4
+with t4:
+    st.subheader("Reconciliation results")
+    a, b = st.columns(2)
+    a.write("**Bank lines by status**"); a.bar_chart(bank_r["recon_status"].value_counts())
+    b.write("**Cash book entries by status**"); b.bar_chart(book_r["recon_status"].value_counts())
+    st.subheader("Exceptions")
+    ex_b = bank_r[~bank_r["recon_status"].isin(["Matched"])][["sn", "date", "narration", "net", "recon_status", "book_ref"]]
+    ex_k = book_r[~book_r["recon_status"].isin(["Matched"])][["ref", "date", "description", "net", "recon_status", "bank_sn"]]
+    st.write("Bank side"); st.dataframe(ex_b, use_container_width=True, height=300)
+    st.write("Cash book side"); st.dataframe(ex_k, use_container_width=True, height=250)
+    st.subheader("Bank reconciliation statement")
+    st.dataframe(statement.assign(**{"Amount (NGN)": statement["Amount (NGN)"].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")}),
+                 use_container_width=True, hide_index=True)
+    if abs(diff) < 0.01:
+        st.success("Reconciled: adjusted bank balance equals adjusted cash book balance.")
+    else:
+        st.error(f"Unreconciled difference of {money(diff)}. Check unmatched items.")
+
+# ----------------------------------------------------------------------------- tab 5
+with t5:
+    st.subheader("Cash flow statement (from classified transactions)")
+    cf = E.cash_flow_statement(classified, opening)
+    st.dataframe(cf.assign(**{"Amount (NGN)": cf["Amount (NGN)"].map(lambda x: f"{x:,.2f}")}), use_container_width=True, hide_index=True)
+    unresolved = classified[classified["category"] == "Unidentified - Suspense"]["net"].sum()
+    if abs(unresolved) > 0:
+        st.warning(f"{money(unresolved)} is sitting in suspense. Resolve it before finalising the statements.")
+    st.subheader("Monthly summary by category")
+    piv = E.monthly_summary(classified)
+    piv.columns = [MONTHS[c - 1] if isinstance(c, (int, float)) else c for c in piv.columns]
+    st.dataframe(piv.round(0), use_container_width=True, height=500)
+    st.subheader("Net cash movement by month")
+    st.line_chart(classified.groupby("month")["net"].sum().rename(lambda m: MONTHS[m - 1]))
+
+# ----------------------------------------------------------------------------- tab 6
+with t6:
+    st.subheader("Accuracy against the Answer Key")
+    if key is None:
+        st.info("No Answer Key in this workbook, so accuracy can't be scored.")
+    else:
+        test_mask = classified["month"] > train_months
+        overall, by_clarity, by_method, merged = E.evaluate_classification(classified, key, test_mask)
+        r_acc, _ = E.evaluate_reconciliation(bank_r, key)
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"Classification accuracy (held-out months {train_months + 1}-12)", f"{overall:.1%}")
+        m2.metric("Reconciliation status accuracy", f"{r_acc:.1%}")
+        auto = merged[~merged["sn"].isin(classified[classified["needs_review"]]["sn"])]
+        m3.metric("Accuracy of auto-accepted items", f"{auto['correct'].mean():.1%}", help=f"{len(auto)} of {len(merged)} items")
+        st.write("**By clarity**"); st.dataframe(by_clarity.style.format({"accuracy": "{:.1%}"}), use_container_width=True)
+        st.write("**By method**"); st.dataframe(by_method.style.format({"accuracy": "{:.1%}"}), use_container_width=True)
+        st.write("**Misclassified items**")
+        st.dataframe(merged[~merged["correct"]][["sn", "narration", "category", "true_category", "confidence", "method", "clarity"]],
+                     use_container_width=True)
+        st.caption("Tip: untick 'keyword rules' in the sidebar to see how the ML layer performs on its own.")
+
+    st.subheader("Export")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        classified.to_excel(xw, sheet_name="Classified", index=False)
+        bank_r.to_excel(xw, sheet_name="Bank recon", index=False)
+        book_r.to_excel(xw, sheet_name="Book recon", index=False)
+        statement.to_excel(xw, sheet_name="Bank rec statement", index=False)
+        E.cash_flow_statement(classified, opening).to_excel(xw, sheet_name="Cash flow", index=False)
+        piv.to_excel(xw, sheet_name="Monthly summary")
+    st.download_button("Download results (.xlsx)", buf.getvalue(), file_name="reconai_results.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
