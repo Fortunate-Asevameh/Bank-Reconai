@@ -428,14 +428,28 @@ def guess_columns(columns, hints):
 
 
 def _num(s):
-    s = s.astype(str).str.replace(r"[,\s\u20a6]|NGN", "", regex=True).str.replace(r"^\((.*)\)$", r"-\1", regex=True)
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+    """Parse money text to floats without regular expressions (works on every pandas/pyarrow version).
+    Handles 1,250,000.00 | N1,250.00 | NGN 500 | (500.00) as negative | blanks."""
+    def conv(x):
+        t = str(x).strip()
+        if t == "" or t.lower() in ("nan", "none", "nat", "-"):
+            return 0.0
+        neg = (t.startswith("(") and t.endswith(")")) or t.startswith("-")
+        t = "".join(ch for ch in t if ch.isdigit() or ch == ".")
+        if t in ("", "."):
+            return 0.0
+        try:
+            v = float(t)
+        except ValueError:
+            return 0.0
+        return -v if neg else v
+    return s.map(conv).astype(float)
 
 
 def _dates(series):
     """Parse dates: ISO (2025-03-10) as year-month-day, everything else day-first (10/03/2025)."""
     x = series.astype(str).str.strip()
-    iso = x.str.match(r"^\d{4}-\d{2}-\d{2}")
+    iso = x.map(lambda t: len(t) >= 10 and t[:4].isdigit() and t[4] == "-" and t[7] == "-")
     out = pd.Series(pd.NaT, index=x.index, dtype="datetime64[ns]")
     if iso.any():
         out[iso] = pd.to_datetime(x[iso].str[:10], format="%Y-%m-%d", errors="coerce")
