@@ -74,7 +74,7 @@ RULES = [
     (r"WHT REMITTANCE", "WHT Remittance", 0.98, "DR"),
     (r"CIT PAYMENT", "Company Income Tax", 0.98, "DR"),
     (r"STAMP DUTY", "Stamp Duty", 0.98, "DR"),
-    (r"UNPAID CHEQUE COMMISSION|ACCOUNT MAINTENANCE|SMS ALERT|NIP TRANSFER FEES|VAT ON BANK CHARGES|SWIFT", "Bank Charges", 0.97, "DR"),
+    (r"UNPAID CHEQUE COMMISSION|ACCOUNT MAINTENANCE|SMS ALERT|NIP TRANSFER FEES|VAT ON BANK CHARGES|SWIFT CHARGES|SWIFT COMM|COMMISSION ON FX|FX COMMISSION|\\bCOT\\b|COMMISSION ON TURNOVER", "Bank Charges", 0.97, "DR"),
     (r"INTEREST ON CREDIT", "Interest Income", 0.97, "CR"),
     (r"RETURNED CHEQUE", "Returned Cheque (Dishonoured)", 0.80, "DR"),
     (r"CHEQUE DEPOSIT", "Sales - Cheque Deposits", 0.90, "CR"),
@@ -97,6 +97,16 @@ RULES = [
     (r"ADEBAYO/(UPKEEP|PERSONAL)|SCHOOL FEES", "Owner Drawings", 0.70, "DR"),
     (r"SAVINGS ACC|TRF FROM 0245", "Transfer Between Own Accounts", 0.65, None),
     (r"MOB TRF-DR|MOBILE TRF CR REF|POS/WEB|TRF FRM 3PL", "Unidentified - Suspense", 0.50, None),
+    # general Nigerian banking vocabulary
+    (r"MTN|AIRTEL|GLO |9MOBILE|AIRTIME|FIBRE|INTERNET", "Utilities (Power & Internet)", 0.90, "DR"),
+    (r"EKEDC|IKEDC|ELECTRICITY|PREPAID", "Utilities (Power & Internet)", 0.92, "DR"),
+    (r"DIESEL|FUEL|PETROL", "Fuel & Logistics", 0.88, "DR"),
+    (r"FREIGHT|HAULAGE|LOGISTICS|TRANSPORT", "Fuel & Logistics", 0.88, "DR"),
+    (r"MAINTENANCE", "Repairs & Maintenance", 0.75, "DR"),
+    (r"DIVIDEND", "Owner Drawings", 0.65, "DR"),
+    (r"GRANT", "Grant / Other Income", 0.80, "CR"),
+    (r"DISPOSAL|SALE OF (VEHICLE|ASSET|EQUIPMENT)", "Asset Disposal Proceeds", 0.80, "CR"),
+    (r"(NIP CR|NIP TRF FROM|TRF FROM)[/ ].*(INV|PMT)", "Sales - Customer Transfers", 0.90, "CR"),
     (r"NIP TRF FROM .*/INV \d+", "Sales - Customer Transfers", 0.95, "CR"),
     (r"(NIP TRF TO|CHQ PAID \d+ -) .*(LTD|PALLETS).*", "Inventory / Supplier Payments", 0.92, "DR"),
 ]
@@ -285,7 +295,7 @@ def bank_rec_statement(bank, book, bank_recon, book_recon, opening):
 
 # ----------------------------------------------------------------------------- summaries
 CLASS_OF = {}
-_INV = {"Equipment & Vehicle Purchases"}
+_INV = {"Equipment & Vehicle Purchases", "Asset Disposal Proceeds"}
 _FIN = {"Loan Proceeds", "Loan Repayment - Principal + Interest", "Loan Facility Fees", "Owner Capital Injection",
         "Director Loan Received", "Director Loan Repaid", "Owner Drawings"}
 _OTH = {"Transfer Between Own Accounts", "Bank Reversal / Error", "Unidentified - Suspense"}
