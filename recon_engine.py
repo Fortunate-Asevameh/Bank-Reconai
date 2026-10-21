@@ -349,3 +349,136 @@ def apply_corrections(classified, corrections):
         out.loc[m, "method"] = "Human"
         out.loc[m, "needs_review"] = False
     return out
+
+
+# ----------------------------------------------------------------------------- importing your own data
+BANK_HINTS = {
+    "date": ["trans date", "transaction date", "posting date", "date", "value date"],
+    "narration": ["narration", "description", "details", "particulars", "remarks", "transaction details"],
+    "debit": ["debit", "withdrawal", "withdrawals", "money out", "paid out", "dr"],
+    "credit": ["credit", "deposit", "deposits", "money in", "paid in", "cr"],
+    "amount": ["amount"],
+    "balance": ["balance", "running balance"],
+    "reference": ["reference", "ref", "trans ref", "cheque no"],
+}
+BOOK_HINTS = {
+    "date": ["date", "trans date", "transaction date"],
+    "description": ["description", "narration", "details", "particulars"],
+    "receipt": ["receipts", "receipt", "money in", "debit", "dr"],
+    "payment": ["payments", "payment", "money out", "credit", "cr"],
+    "amount": ["amount"],
+}
+_HEADER_WORDS = ("date", "narration", "description", "details", "particulars", "debit", "credit", "amount", "balance",
+                 "receipt", "payment", "withdraw", "deposit")
+
+
+def read_table(file, filename=""):
+    """Read a CSV/Excel file and auto-detect the header row (skips title/preamble rows)."""
+    name = (filename or getattr(file, "name", "")).lower()
+    if name.endswith(".csv"):
+        import csv, io
+        data = file.read() if hasattr(file, "read") else open(file, "rb").read()
+        if isinstance(data, bytes):
+            data = data.decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(data)))
+        width = max((len(r) for r in rows), default=0)
+        raw = pd.DataFrame([r + [""] * (width - len(r)) for r in rows], dtype=str)
+    else:
+        raw = pd.read_excel(file, header=None, dtype=str)
+    raw = raw.fillna("")
+    hdr = 0
+    for i in range(min(len(raw), 30)):
+        cells = [str(c).strip().lower() for c in raw.iloc[i]]
+        if sum(1 for c in cells if any(w in c for w in _HEADER_WORDS)) >= 2:
+            hdr = i; break
+    df = raw.iloc[hdr + 1:].copy()
+    cols, seen = [], {}
+    for j, c in enumerate(raw.iloc[hdr]):
+        c = str(c).strip() or f"Column {j + 1}"
+        seen[c] = seen.get(c, 0) + 1
+        cols.append(c if seen[c] == 1 else f"{c} ({seen[c]})")
+    df.columns = cols
+    return df.reset_index(drop=True)
+
+
+def guess_columns(columns, hints):
+    """Best-guess mapping {field: column name or None} from header names."""
+    low = {c: str(c).strip().lower() for c in columns}
+    out = {}
+    for field, words in hints.items():
+        out[field] = None
+        for w in words:                       # exact header match first
+            hit = [c for c, l in low.items() if l == w]
+            if hit: out[field] = hit[0]; break
+        if out[field] is None:
+            for w in words:                   # then 'contains'
+                hit = [c for c, l in low.items() if w in l and len(w) > 3]
+                if hit: out[field] = hit[0]; break
+    return out
+
+
+def _num(s):
+    s = s.astype(str).str.replace(r"[,\s\u20a6]|NGN", "", regex=True).str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def _dates(series):
+    """Parse dates: ISO (2025-03-10) as year-month-day, everything else day-first (10/03/2025)."""
+    x = series.astype(str).str.strip()
+    iso = x.str.match(r"^\d{4}-\d{2}-\d{2}")
+    out = pd.Series(pd.NaT, index=x.index, dtype="datetime64[ns]")
+    if iso.any():
+        out[iso] = pd.to_datetime(x[iso].str[:10], format="%Y-%m-%d", errors="coerce")
+    if (~iso).any():
+        out[~iso] = pd.to_datetime(x[~iso], dayfirst=True, errors="coerce", format="mixed")
+    return out
+
+
+def standardise_bank(raw, m):
+    """Convert a raw bank table + column mapping into the engine's bank format."""
+    df = pd.DataFrame({"date": _dates(raw[m["date"]]),
+                       "narration": raw[m["narration"]].astype(str).str.strip()})
+    if m.get("debit") and m.get("credit"):
+        df["debit"] = _num(raw[m["debit"]]).abs(); df["credit"] = _num(raw[m["credit"]]).abs()
+    elif m.get("amount"):
+        a = _num(raw[m["amount"]]); df["credit"] = a.clip(lower=0); df["debit"] = (-a).clip(lower=0)
+    else:
+        raise ValueError("Map either Debit and Credit columns, or a single Amount column.")
+    df["reference"] = raw[m["reference"]].astype(str) if m.get("reference") else ""
+    df["balance"] = _num(raw[m["balance"]]) if m.get("balance") else np.nan
+    df = df[df["date"].notna() & (df["narration"] != "") & ((df["debit"] > 0) | (df["credit"] > 0))].reset_index(drop=True)
+    df.insert(0, "sn", range(1, len(df) + 1))
+    return _clean_bank(df)
+
+
+def standardise_book(raw, m):
+    """Convert a raw cash book table + column mapping into the engine's cash book format."""
+    df = pd.DataFrame({"date": _dates(raw[m["date"]]),
+                       "description": raw[m["description"]].astype(str).str.strip()})
+    if m.get("receipt") and m.get("payment"):
+        df["receipt"] = _num(raw[m["receipt"]]).abs(); df["payment"] = _num(raw[m["payment"]]).abs()
+    elif m.get("amount"):
+        a = _num(raw[m["amount"]]); df["receipt"] = a.clip(lower=0); df["payment"] = (-a).clip(lower=0)
+    else:
+        raise ValueError("Map either Receipt and Payment columns, or a single Amount column.")
+    df = df[df["date"].notna() & ((df["receipt"] > 0) | (df["payment"] > 0))].reset_index(drop=True)
+    df.insert(0, "ref", [f"CB-{i:04d}" for i in range(1, len(df) + 1)])
+    return _clean_book(df)
+
+
+# ----------------------------------------------------------------------------- bank-only mode (no cash book)
+def empty_book():
+    """An empty cash book, used when the user has no cash book to upload."""
+    return _clean_book(pd.DataFrame({"ref": [], "date": [], "description": [], "receipt": [], "payment": []}))
+
+
+def bank_only_checks(bank):
+    """Integrity checks that need no cash book: possible duplicates and running-balance breaks."""
+    out = {}
+    dup = bank[bank.duplicated(["date", "net"], keep=False)].sort_values(["date", "net", "sn"])
+    out["duplicates"] = dup[["sn", "date", "narration", "debit", "credit"]]
+    if "balance" in bank and bank["balance"].notna().all():
+        expected = bank["balance"].iloc[0] + bank["net"].iloc[1:].cumsum().reindex(bank.index, fill_value=0.0)
+        brk = bank[(expected - bank["balance"]).abs() > 0.01]
+        out["balance_breaks"] = brk[["sn", "date", "narration", "debit", "credit", "balance"]]
+    return out
