@@ -506,3 +506,13 @@ def bank_only_checks(bank):
         brk = bank[(expected - bank["balance"]).abs() > 0.01]
         out["balance_breaks"] = brk[["sn", "date", "narration", "debit", "credit", "balance"]]
     return out
+
+
+# ----------------------------------------------------------------------------- self-training (learn only from the uploaded statement)
+def self_train_model(base, min_conf=0.90, min_rows=10):
+    """Train a text model on THIS statement's own confident classifications
+    (keyword-rule hits and human corrections). Returns None if there is too little to learn from."""
+    tr = base[base["confidence"] >= min_conf]
+    if len(tr) < min_rows or tr["category"].nunique() < 2:
+        return None
+    return train_model(tr, tr["category"])
