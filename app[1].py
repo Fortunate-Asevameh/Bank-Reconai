@@ -116,8 +116,17 @@ else:
 
 st.sidebar.subheader("Settings")
 use_rules = st.sidebar.checkbox("Layer 1: keyword rules", value=True)
+OPT_SAMPLE = "Bundled sample data"
+OPT_SELF = "This statement only (self-training)"
+OPT_OFF = "Off (rules only)"
+ml_source = st.sidebar.radio(
+    "Layer 2: what should the ML layer learn from?", [OPT_SAMPLE, OPT_SELF, OPT_OFF],
+    index=1 if source.startswith("Upload my own") else 0, key=f"ml_{source}",
+    help="Self-training learns only from this statement's own narrations: transactions the rules recognise confidently "
+         "(plus your corrections) teach the model how to classify the remaining ones. Nothing from the sample data is used.")
 threshold = st.sidebar.slider("Review threshold (confidence below this goes to review)", 0.30, 0.95, 0.70, 0.05)
-if key is not None:
+use_split = (key is not None) and ml_source == OPT_SAMPLE
+if use_split:
     train_months = st.sidebar.slider("ML training window (first N months, needs Answer Key)", 3, 11, 6)
 else:
     train_months = 12
@@ -129,20 +138,32 @@ if "corrections" not in st.session_state:
 if "extra_train" not in st.session_state:
     st.session_state.extra_train = False
 
-if key is not None:
-    lab = bank.merge(key, on="sn")
-    tr = lab[lab["month"] <= train_months]
+model = None
+if ml_source == OPT_SAMPLE:
+    if key is not None:
+        lab = bank.merge(key, on="sn")
+        tr = lab[lab["month"] <= train_months]
+    else:
+        sample_bank, _, sample_key = load(SAMPLE)
+        tr = sample_bank.merge(sample_key, on="sn")
+        st.sidebar.info("The ML layer is trained on the bundled sample, then applied to your transactions.")
+    model = E.train_model(tr, tr["true_category"])
+elif ml_source == OPT_SELF:
+    st.sidebar.caption("The ML layer learns only from this statement: rule-confirmed and human-corrected transactions teach it to classify the rest.")
+    base = E.classify(bank, None, threshold, use_rules=use_rules)
+    base = E.apply_corrections(base, st.session_state.corrections)
+    model = E.self_train_model(base)
+    if model is None:
+        st.sidebar.warning("Not enough confidently classified transactions in this statement to train on yet (need 10+ across 2+ categories). "
+                           "Turn on the keyword rules or correct some items in the Review queue.")
 else:
-    sample_bank, _, sample_key = load(SAMPLE)
-    tr = sample_bank.merge(sample_key, on="sn")
-    st.sidebar.info("No answer key for this data: the ML layer is trained on the bundled sample, then applied to your transactions.")
-model = E.train_model(tr, tr["true_category"])
+    st.sidebar.caption("ML layer is off: only keyword rules classify. Everything else goes to the review queue.")
 
 classified = E.classify(bank, model, threshold, use_rules=use_rules)
 classified = E.apply_corrections(classified, st.session_state.corrections)
 
-# optional: retrain using corrections + confident results
-if st.session_state.extra_train and st.session_state.corrections:
+# optional: retrain using corrections + confident results (bundled-sample mode only; self-training already uses corrections)
+if st.session_state.extra_train and st.session_state.corrections and ml_source == OPT_SAMPLE:
     conf = classified[(classified["confidence"] >= 0.9)]
     model2 = E.train_model(conf, conf["category"])
     classified = E.classify(bank, model2, threshold, use_rules=use_rules)
@@ -276,11 +297,11 @@ with t6:
     if key is None:
         st.info("No answer key is available for this data, so accuracy can't be scored. You can still review the classifications, the reconciliation exceptions, and the reports.")
     else:
-        test_mask = classified["month"] > train_months
+        test_mask = classified["month"] > (train_months if use_split else 0)
         overall, by_clarity, by_method, merged = E.evaluate_classification(classified, key, test_mask)
         r_acc, _ = E.evaluate_reconciliation(bank_r, key)
         m1, m2, m3 = st.columns(3)
-        m1.metric(f"Classification accuracy (held-out months {train_months + 1}-12)", f"{overall:.1%}")
+        m1.metric(f"Classification accuracy (held-out months {train_months + 1}-12)" if use_split else "Classification accuracy (all transactions)", f"{overall:.1%}")
         m2.metric("Reconciliation status accuracy", f"{r_acc:.1%}")
         auto = merged[~merged["sn"].isin(classified[classified["needs_review"]]["sn"])]
         m3.metric("Accuracy of auto-accepted items", f"{auto['correct'].mean():.1%}", help=f"{len(auto)} of {len(merged)} items")
