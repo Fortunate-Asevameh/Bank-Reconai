@@ -65,6 +65,12 @@ In the sidebar choose **Data source**:
    - If your bank file has no Balance column, type the opening balance in the sidebar.
    - Tick "newest-first" if the bank file lists the latest transaction at the top.
 
+**Choosing what the ML layer learns from** (sidebar, "Layer 2"):
+- *Bundled sample data* - trained on the sample's labelled transactions, then applied to yours.
+- *This statement only (self-training)* - the default for your own uploads. Transactions the keyword rules recognise confidently, plus every
+  correction you make in the Review queue, teach the model how to classify the rest. Nothing from the sample is used.
+- *Off (rules only)* - only keyword rules classify; everything else goes to the review queue.
+
 **No cash book?** Leave the cash book uploader empty. The app then classifies transactions and builds the cash flow summary,
 but skips reconciliation. The Reconciliation tab instead runs bank-only checks: possible duplicate transactions and running-balance breaks.
 
